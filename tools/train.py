@@ -1,6 +1,7 @@
 import sys
 
 from models.model import BaseNet
+from models.half_zero import HalfZeroCDNet
 
 sys.path.insert(0, '.')
 
@@ -16,7 +17,7 @@ from metric_tool import ConfuseMatrixMeter
 import utils
 import matplotlib.pyplot as plt
 
-import os, time
+import os, time, json, random
 import numpy as np
 from argparse import ArgumentParser
 
@@ -194,8 +195,15 @@ def trainValidateSegmentation(args):
     SEED = 2333
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
 
-    model = BaseNet(3, 1)
+    model = BaseNet(3, 1) if args.arch == 'author' else HalfZeroCDNet()
+    if args.initial_author_state:
+        author_state = torch.load(args.initial_author_state, map_location='cpu', weights_only=True)
+        (model if args.arch == 'author' else model.base).load_state_dict(author_state, strict=True)
+        if args.arch == 'half_zero':
+            model.half_cls.load_state_dict(model.base.swa.cls.state_dict(), strict=True)
 
     args.savedir = args.savedir + '_' + args.file_root + '_iter_' + str(args.max_steps) + '_lr_' + str(args.lr) + '/'
     args.vis_dir = args.savedir + '/Vis/'
@@ -255,7 +263,8 @@ def trainValidateSegmentation(args):
     trainLoader = torch.utils.data.DataLoader(
         train_data,
         batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=False, drop_last=True
+        num_workers=args.num_workers, pin_memory=False, drop_last=True,
+        generator=torch.Generator().manual_seed(SEED)
     )
 
     val_data = myDataLoader.Dataset("val", file_root=args.file_root, transform=valDataset)
@@ -263,16 +272,28 @@ def trainValidateSegmentation(args):
         val_data, shuffle=False,
         batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=False)
 
-    test_data = myDataLoader.Dataset("test", file_root=args.file_root, transform=valDataset)
-    testLoader = torch.utils.data.DataLoader(
-        test_data, shuffle=False,
-        batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=False)
+    if args.eval_test:
+        test_data = myDataLoader.Dataset("test", file_root=args.file_root, transform=valDataset)
+        testLoader = torch.utils.data.DataLoader(
+            test_data, shuffle=False,
+            batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=False)
 
     # whether use multi-scale training
 
     max_batches = len(trainLoader)
 
     print('For each epoch, we have {} batches'.format(max_batches))
+    run_config = {'arch': args.arch, 'seed': SEED, 'data_root': args.file_root,
+                  'train_images': len(train_data), 'val_images': len(val_data),
+                  'batch_size': args.batch_size, 'max_steps': args.max_steps,
+                  'lr': args.lr, 'lr_mode': args.lr_mode, 'step_loss': args.step_loss,
+                  'initial_author_state': args.initial_author_state,
+                  'trainable_params': sum(p.numel() for p in model.parameters() if p.requires_grad),
+                  'test_used': args.eval_test, 'threshold': 0.5,
+                  'gt_policy': 'original BCDD GT, including all-black val/4887.png'}
+    with open(os.path.join(args.savedir, 'run_config.json'), 'w') as config_file:
+        json.dump(run_config, config_file, indent=2)
+    print('TRAIN_START', json.dumps(run_config), flush=True)
 
     if args.onGPU:
         cudnn.benchmark = True
@@ -326,6 +347,12 @@ def trainValidateSegmentation(args):
                                                                        score_val['F1'], score_val['recall'],
                                                                        score_val['precision']))
         logger.flush()
+        with open(os.path.join(args.savedir, 'val_metrics.jsonl'), 'a') as metrics_file:
+            metrics_file.write(json.dumps({'epoch_index': epoch, 'completed_passes': epoch + 1,
+                                           'F1': float(score_val['F1']), 'IoU': float(score_val['IoU']),
+                                           'recall': float(score_val['recall']),
+                                           'precision': float(score_val['precision']),
+                                           'val_loss': float(lossVal)}) + '\n')
 
         torch.save({
             'epoch': epoch + 1,
@@ -349,21 +376,19 @@ def trainValidateSegmentation(args):
         print("\nEpoch No. %d:\tTrain Loss = %.4f\tVal Loss = %.4f\t F1(tr) = %.4f\t F1(val) = %.4f" \
               % (epoch, lossTr, lossVal, score_tr['F1'], score_val['F1']))
         torch.cuda.empty_cache()
-    state_dict = torch.load(model_file_name)
-    model.load_state_dict(state_dict)
-
-    loss_test, score_test = val(args, testLoader, model, 0)
-    print("\nTest :\t Kappa (te) = %.4f\t IoU (te) = %.4f\t F1 (te) = %.4f\t R (te) = %.4f\t P (te) = %.4f" \
-          % (score_test['Kappa'], score_test['IoU'], score_test['F1'], score_test['recall'], score_test['precision']))
-    logger.write("\n%s\t\t%.4f\t\t%.4f\t\t%.4f\t\t%.4f\t\t%.4f" % ('Test', score_test['Kappa'], score_test['IoU'],
-                                                                   score_test['F1'], score_test['recall'],
-                                                                   score_test['precision']))
-    logger.flush()
+    if args.eval_test:
+        state_dict = torch.load(model_file_name, map_location='cpu', weights_only=True)
+        model.load_state_dict(state_dict)
+        loss_test, score_test = val(args, testLoader, model, 0)
+        print('Test metrics:', score_test)
     logger.close()
 
 
 if __name__ == '__main__':
     parser = ArgumentParser()
+    parser.add_argument('--arch', choices=['author', 'half_zero'], default='author')
+    parser.add_argument('--initial_author_state', default='', help='Shared fresh author initialization')
+    parser.add_argument('--eval_test', action='store_true', help='Explicit final test evaluation only')
     parser.add_argument('--file_root', default="LEVIR", help='Data directory | LEVIR | BCDD | SYSU ')
     parser.add_argument('--inWidth', type=int, default=256, help='Width of RGB image')
     parser.add_argument('--inHeight', type=int, default=256, help='Height of RGB image')
