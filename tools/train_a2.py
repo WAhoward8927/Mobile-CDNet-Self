@@ -1,6 +1,8 @@
 import sys
 
-from models_a2net.ablation import A2NetAblation   # [Opus 5.5] train_a2.py = train_p1.py + A2Net ablation models
+from models_a2net.ablation import A2NetAblation
+from models.model import BaseNet as MobileCDNet   # [Opus 5.5] author BaseNet via the same script
+from models.model_litetf import build as build_litetf   # [Opus 5.5] lightweight temporal fusion A / AB / ABC   # [Opus 5.5] train_a2.py = train_p1.py + A2Net ablation models
 # [Opus 5.5] Phase-1 training script. Fixes vs. tools/train.py:
 #  (1) pre/post channel order (ToTensorRGB), (2) resume keeps best F1 / EMA / best epoch,
 #  (3) one data root for train/val/test + counts logged, (4) full seeding (torch/numpy/random/workers).
@@ -226,7 +228,7 @@ def trainValidateSegmentation(args):
     SEED = args.seed
     torch.manual_seed(SEED); torch.cuda.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
 
-    model = A2NetAblation(args.variant)
+    model = MobileCDNet(3, 1) if args.variant == 'mobilecdnet' else (build_litetf(args.variant) if args.variant.startswith('litetf_') else A2NetAblation(args.variant))
     print('A2_VARIANT', args.variant, 'params', sum(p.numel() for p in model.parameters()), flush=True)
 
     args.savedir = args.savedir + '_' + args.file_root + '_iter_' + str(args.max_steps) + '_lr_' + str(args.lr) + '_seed' + str(SEED) + '/'
@@ -410,7 +412,7 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--file_root', default="LEVIR", help='Data directory | LEVIR | BCDD | SYSU ')
     parser.add_argument('--seed', type=int, default=2333)
-    parser.add_argument('--variant', default='full', choices=['full', 'noTFFM', 'noSAM'])
+    parser.add_argument('--variant', default='full', choices=['full', 'noTFFM', 'noSAM', 'mobilecdnet', 'litetf_A', 'litetf_AB', 'litetf_ABC'])
     parser.add_argument('--color_jitter', type=int, default=1, help='per-temporal colour jitter (0/1)')
     parser.add_argument('--pre_shift', type=int, default=4, help='max random shift of pre image in px (0 = off)')
     parser.add_argument('--rot90', type=int, default=1, help='random 90-degree rotation (0/1)')
